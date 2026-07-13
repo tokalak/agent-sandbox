@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# Starts a rootless (non-root, capability-dropped) Docker container with
+# claude-code, command-code, opencode and pi.dev installed, bind-mounts the
+# CURRENT working directory read-write as /workspace, and either drops you
+# into a shell there or starts the requested agent directly. No other host
+# directory is mounted.
+set -euo pipefail
+
+# Resolve the real directory this script lives in, even when invoked
+# through a symlink (e.g. from ~/.local/bin) — the Dockerfile lives
+# alongside it in the same repo checkout.
+SOURCE="${BASH_SOURCE[0]}"
+while [[ -h "$SOURCE" ]]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SANDBOX_HOME="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+IMAGE_NAME="agent-sandbox:latest"
+PROJECTS_ROOT="$HOME/Projects"
+PROJECT_DIR="$(pwd -P)"
+
+usage() {
+  cat <<'EOF'
+Usage: agent-sandbox [--rebuild] [agent [agent-args...]]
+
+  agent       Which agent to start inside the container:
+                claude | cmd (alias for commandcode) | opencode | pi
+              The agent's host-side configuration and credentials are
+              copied into the container and the agent starts directly in
+              /workspace with FULL permissions (no approval prompts) — the
+              container is the safety boundary. Everything after the agent
+              name is passed to the agent itself, e.g.:
+                agent-sandbox claude --continue
+              Without an agent you get a shell, with the configuration of
+              all agents copied in; agents you start manually there use
+              their normal permission prompts.
+
+  --rebuild   Force a rebuild of the sandbox image before starting.
+              (Must come before the agent name.)
+  -h, --help  Show this help.
+
+Environment:
+  AGENT_SANDBOX_ENV   Whitespace-separated names of host environment
+                      variables to forward into the container, e.g.
+                      AGENT_SANDBOX_ENV="OPENAI_API_KEY MY_TOKEN" agent-sandbox
+
+Run this from inside the project directory you want to work on; only that
+directory is mounted into the container (read-write, at /workspace).
+EOF
+}
+
+REBUILD=0
+AGENT=""
+AGENT_ARGS=()
+while (( $# )); do
+  case "$1" in
+    --rebuild) REBUILD=1 ;;
+    -h|--help) usage; exit 0 ;;
+    claude|cmd|commandcode|opencode|pi)
+      AGENT="$1"
+      shift
+      AGENT_ARGS=("$@")
+      break
+      ;;
+    *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
+  esac
+  shift
+done
+[[ "$AGENT" == "cmd" ]] && AGENT="commandcode"
+
+# Refuse to run outside ~/Projects: this tool grants a coding agent
+# full read/write/delete over whatever it mounts, so it must never be
+# pointed at $HOME itself or an unrelated directory by accident.
+if [[ ! -d "$PROJECTS_ROOT" ]]; then
+  echo "Error: $PROJECTS_ROOT does not exist." >&2
+  exit 1
+fi
+RESOLVED_PROJECTS_ROOT="$(cd "$PROJECTS_ROOT" && pwd -P)"
+case "$PROJECT_DIR" in
+  "$RESOLVED_PROJECTS_ROOT"/*) ;;
+  *)
+    echo "Error: agent-sandbox must be run from a subfolder of $PROJECTS_ROOT (current directory: $PROJECT_DIR)" >&2
+    exit 1
+    ;;
+esac
+
+if [[ "$REBUILD" -eq 1 ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+  echo "Building $IMAGE_NAME ..." >&2
+  docker build \
+    --build-arg HOST_UID="$(id -u)" \
+    --build-arg HOST_GID="$(id -g)" \
+    -t "$IMAGE_NAME" \
+    "$SANDBOX_HOME"
+fi
+
+# Name the container after the project folder; if that name is already
+# taken (e.g. another agent-sandbox is already running for this project),
+# append -2, -3, ... until a free name is found.
+base_name="$(basename "$PROJECT_DIR")"
+base_name="$(printf '%s' "$base_name" | tr -c 'a-zA-Z0-9_.-' '-')"
+[[ "$base_name" =~ ^[a-zA-Z0-9] ]] || base_name="sandbox-$base_name"
+container_name="$base_name"
+suffix=2
+while docker ps -a --format '{{.Names}}' | grep -qx "$container_name"; do
+  container_name="${base_name}-${suffix}"
+  suffix=$((suffix + 1))
+done
+echo "Starting container: $container_name" >&2
+
+DOCKER_ARGS=(
+  run --rm -it
+  --name "$container_name"
+  --workdir /workspace
+  --cap-drop=ALL
+  --security-opt no-new-privileges
+  -v "$PROJECT_DIR:/workspace:rw"
+)
+
+# Prevent the agent from planting code that would later execute on the HOST
+# when git is run there (hooks in .git/hooks, or core.fsmonitor / hooksPath /
+# filter commands in .git/config): overlay those two paths read-only on top
+# of the read-write workspace mount. Git inside the container still works
+# for reading and local commits; only reconfiguring the repo is blocked.
+if [[ -d "$PROJECT_DIR/.git" ]]; then
+  [[ -f "$PROJECT_DIR/.git/config" ]] && \
+    DOCKER_ARGS+=(-v "$PROJECT_DIR/.git/config:/workspace/.git/config:ro")
+  [[ -d "$PROJECT_DIR/.git/hooks" ]] && \
+    DOCKER_ARGS+=(-v "$PROJECT_DIR/.git/hooks:/workspace/.git/hooks:ro")
+fi
+
+# Forward only explicitly whitelisted host environment variables into the
+# container: AGENT_SANDBOX_ENV holds their NAMES (whitespace-separated).
+# Passing `-e NAME` without a value makes docker read the value from this
+# process's environment itself, so secrets never appear on a command line.
+for var_name in ${AGENT_SANDBOX_ENV:-}; do
+  if [[ ! "$var_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    echo "Warning: ignoring invalid name in AGENT_SANDBOX_ENV: $var_name" >&2
+    continue
+  fi
+  if [[ -z "${!var_name+x}" ]]; then
+    echo "Warning: $var_name is listed in AGENT_SANDBOX_ENV but not set in the environment; skipping." >&2
+    continue
+  fi
+  DOCKER_ARGS+=(-e "$var_name")
+done
+
+# --- Agent configuration ---
+# Host-side agent config and credentials are COPIED into the container
+# rather than bind-mounted at their final locations: they are staged into a
+# temp dir (mirroring the container home's layout), mounted read-only at
+# /agent-config, and copied into $HOME by the container's startup command.
+# The agent gets a writable config (token refreshes, settings changes work)
+# while the host originals are never exposed to the container at all; the
+# copies are discarded with the container, and the staging dir is deleted
+# on exit.
+STAGING="$(mktemp -d "${TMPDIR:-/tmp}/agent-sandbox.XXXXXX")"
+chmod 700 "$STAGING"
+cleanup() {
+  [[ -d "$STAGING" ]] || return 0
+  # Best-effort shred of staged credential copies (no shred on stock macOS).
+  find "$STAGING" -type f -exec shred -u {} + 2>/dev/null || true
+  rm -rf "$STAGING"
+}
+trap cleanup EXIT
+
+stage() { # stage <host-path> <path-relative-to-container-home>
+  local src="$1" dst="$STAGING/$2"
+  [[ -e "$src" ]] || return 0
+  mkdir -p "$(dirname "$dst")"
+  cp -a "$src" "$dst"
+}
+
+stage_claude() {
+  # On Linux, Claude Code keeps its credentials in a plain file; on macOS it
+  # uses the login Keychain instead, so the secret has to be exported.
+  if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+    stage "$HOME/.claude/.credentials.json" .claude/.credentials.json
+  elif [[ "$(uname -s)" == "Darwin" ]]; then
+    if creds="$(security find-generic-password -s "Claude Code-credentials" -a "$(whoami)" -w 2>/dev/null)"; then
+      mkdir -p "$STAGING/.claude"
+      printf '%s' "$creds" > "$STAGING/.claude/.credentials.json"
+      chmod 600 "$STAGING/.claude/.credentials.json"
+    else
+      echo "Note: no Claude Code credentials found in the Keychain; run '/login' inside the container." >&2
+    fi
+  fi
+  local item
+  for item in settings.json CLAUDE.md commands agents skills; do
+    stage "$HOME/.claude/$item" ".claude/$item"
+  done
+  # ~/.claude.json carries onboarding state and global settings, but also
+  # per-project history for every project on the host — strip that (when jq
+  # is available) so other projects don't leak into the sandbox.
+  if [[ -f "$HOME/.claude.json" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq '.projects = {}' "$HOME/.claude.json" > "$STAGING/.claude.json"
+    else
+      cp "$HOME/.claude.json" "$STAGING/.claude.json"
+    fi
+    chmod 600 "$STAGING/.claude.json"
+  fi
+}
+
+stage_commandcode() {
+  stage "$HOME/.commandcode/auth.json" .commandcode/auth.json
+  stage "$HOME/.commandcode/config.json" .commandcode/config.json
+}
+
+stage_opencode() {
+  stage "$HOME/.local/share/opencode/auth.json" .local/share/opencode/auth.json
+  # Copy only actual configuration — ~/.config/opencode also holds a
+  # node_modules tree for plugins, which is large and machine-specific
+  # (plugins reinstall inside the container on first start if needed).
+  local item
+  for item in opencode.json opencode.jsonc AGENTS.md agent command mode themes plugin; do
+    stage "$HOME/.config/opencode/$item" ".config/opencode/$item"
+  done
+}
+
+stage_pi() {
+  stage "$HOME/.pi/agent/auth.json" .pi/agent/auth.json
+  stage "$HOME/.pi/agent/settings.json" .pi/agent/settings.json
+}
+
+case "$AGENT" in
+  claude)      stage_claude ;;
+  commandcode) stage_commandcode ;;
+  opencode)    stage_opencode ;;
+  pi)          stage_pi ;;
+  "")          stage_claude; stage_commandcode; stage_opencode; stage_pi ;;
+esac
+
+DOCKER_ARGS+=(-v "$STAGING:/agent-config:ro")
+
+# Agents launched by name start with FULL permissions — no approval prompts.
+# That is the whole point of this sandbox: the container is the safety
+# boundary, not the agent's permission system. Pi runs with full permissions
+# by default; the others need an explicit flag.
+case "$AGENT" in
+  claude)      AGENT_CMD=(claude --dangerously-skip-permissions) ;;
+  commandcode) AGENT_CMD=(commandcode --dangerously-skip-permissions) ;;
+  opencode)    AGENT_CMD=(opencode --auto) ;;
+  pi)          AGENT_CMD=(pi) ;;
+  *)           AGENT_CMD=() ;;
+esac
+
+# The container copies the staged config into its home first, then execs the
+# requested agent (or a login shell). Arguments after the agent name travel
+# as bash positional parameters, so no extra quoting layer is needed.
+BOOTSTRAP='cp -a /agent-config/. "$HOME"/ && exec "$@"'
+if [[ -n "$AGENT" ]]; then
+  DOCKER_ARGS+=("$IMAGE_NAME" bash -lc "$BOOTSTRAP" bash "${AGENT_CMD[@]}" ${AGENT_ARGS[@]+"${AGENT_ARGS[@]}"})
+else
+  DOCKER_ARGS+=("$IMAGE_NAME" bash -lc "$BOOTSTRAP" bash bash -l)
+fi
+
+# Deliberately not `exec`: the shell must survive docker so the EXIT trap
+# above still runs and deletes the staged credential copies.
+docker "${DOCKER_ARGS[@]}"
