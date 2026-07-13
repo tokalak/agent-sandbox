@@ -116,12 +116,12 @@ Nothing from your environment is forwarded into the container by default —
 notably, a `.env` file in the project is **not** read automatically, since
 that would silently hand every secret in it to the assistant.
 
-If the assistant needs specific variables (an API key, a database URL),
+If the assistant needs specific variables (an API key etc.),
 whitelist them by name in `AGENT_SANDBOX_ENV`:
 
 ```
 export OPENAI_API_KEY=sk-...
-AGENT_SANDBOX_ENV="OPENAI_API_KEY DATABASE_URL" agent-sandbox
+AGENT_SANDBOX_ENV="OPENAI_API_KEY OPENCODE_API_KEY" agent-sandbox
 ```
 
 Only the listed names are forwarded; their values are read by Docker
