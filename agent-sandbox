@@ -36,8 +36,10 @@ Usage: agent-sandbox [--rebuild] [agent [agent-args...]]
               all agents copied in; agents you start manually there use
               their normal permission prompts.
 
-  --rebuild   Force a rebuild of the sandbox image before starting.
-              (Must come before the agent name.)
+  --rebuild   Force a rebuild of the sandbox image before starting, pulling
+              in the latest versions of the bundled agents. Run this after
+              updating an agent on your host. (Must come before the agent
+              name.)
   -h, --help  Show this help.
 
 Environment:
@@ -87,9 +89,12 @@ esac
 
 if [[ "$REBUILD" -eq 1 ]] || ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
   echo "Building $IMAGE_NAME ..." >&2
+  # AGENTS_BUILD_ID is always fresh, so a rebuild re-resolves the agents'
+  # "@latest" npm tags instead of reusing the cached install layer.
   docker build \
     --build-arg HOST_UID="$(id -u)" \
     --build-arg HOST_GID="$(id -g)" \
+    --build-arg AGENTS_BUILD_ID="$(date +%s)" \
     -t "$IMAGE_NAME" \
     "$SANDBOX_HOME"
 fi

@@ -170,9 +170,14 @@ rely on those in some repos, re-enable per repo with
 
 ## Updating
 
-After editing the `Dockerfile` (e.g. to add another tool), rebuild the
-image once:
+The agents are installed into the image at build time, so updating an agent
+on your host does **not** update the sandbox — the container keeps running
+the versions from when the image was built. To pull the latest agent
+versions into the sandbox (and after editing the `Dockerfile`, e.g. to add
+another tool), rebuild the image once:
 ```
 agent-sandbox --rebuild
 ```
-Subsequent runs use the updated image automatically.
+The rebuild re-resolves the agents' `@latest` npm tags (a fresh build
+argument busts the Docker cache for that layer, so it never goes stale).
+Subsequent runs use the updated image and start instantly again.

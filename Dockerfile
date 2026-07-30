@@ -28,7 +28,13 @@ RUN set -eux; \
         useradd -u "$HOST_UID" -g "$HOST_GID" -m -s /bin/bash agent; \
     fi
 
-RUN npm install -g \
+# "@latest" resolves at build time, so Docker would reuse this cached layer
+# on rebuilds and pin the agents to their build-day versions forever.
+# AGENTS_BUILD_ID changes on every --rebuild, busting the cache for this
+# layer only (the apt layer above stays cached).
+ARG AGENTS_BUILD_ID=0
+RUN echo "Installing coding agents (build $AGENTS_BUILD_ID)" \
+    && npm install -g \
       @anthropic-ai/claude-code \
       command-code@latest \
       opencode-ai \
