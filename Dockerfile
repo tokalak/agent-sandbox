@@ -6,8 +6,14 @@ FROM node:22-bookworm-slim
 ARG HOST_UID=1000
 ARG HOST_GID=1000
 
+# chromium: lets agents verify their own work (load the app they built,
+# screenshot it, click through it) via agent-browser. The Debian package
+# pulls in all required system libraries and works on arm64, where Chrome
+# for Testing (agent-browser's own download) is unavailable.
+# fonts-liberation: without it headless screenshots render tofu boxes.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash git curl ca-certificates ripgrep jq less procps openssh-client unzip vim \
+      chromium fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root "agent" user whose UID/GID match the host caller's, so
@@ -39,10 +45,20 @@ RUN echo "Installing coding agents (build $AGENTS_BUILD_ID)" \
       command-code@latest \
       opencode-ai \
       @earendil-works/pi-coding-agent \
+      agent-browser \
     && npm cache clean --force
 
 USER agent
 WORKDIR /workspace
 ENV HOME=/home/agent
+
+# Point agent-browser at the system Chromium (its own Chrome-for-Testing
+# download has no Linux arm64 build and would need --with-deps as root).
+# --no-sandbox: Chrome's in-process sandbox needs capabilities/userns that
+# this image deliberately drops; the container itself is the sandbox.
+# --disable-dev-shm-usage: Docker's default /dev/shm is 64MB, too small
+# for Chromium renderers.
+ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium \
+    AGENT_BROWSER_ARGS="--no-sandbox,--disable-dev-shm-usage"
 
 CMD ["bash"]

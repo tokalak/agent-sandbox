@@ -85,6 +85,34 @@ Multiple sandboxes for the same project can run in parallel — each gets its
 own container, named after the project folder (`my-website`, `my-website-2`,
 `my-website-3`, ...).
 
+## Letting agents check their own work
+
+The image includes [agent-browser](https://github.com/vercel-labs/agent-browser)
+and a headless Chromium, so an agent can run the app it just built and look at
+the result instead of guessing:
+
+```
+agent-browser open http://localhost:3000
+agent-browser snapshot -i          # accessibility tree with element refs
+agent-browser screenshot page.png  # visual check
+agent-browser click @e3            # interact
+```
+
+Any agent can drive it via the CLI (`agent-browser --help` is
+self-explanatory); Command Code additionally ships a bundled agent-browser
+skill, so `agent-sandbox cmd` gets the full workflow guidance out of the box.
+
+Two deliberate constraints to know about:
+
+- Chromium runs with `--no-sandbox`: its in-process sandbox needs kernel
+  capabilities this image drops on purpose. The container is the security
+  boundary, exactly as for everything else the agent runs.
+- A browsing agent will encounter untrusted web content, which can carry
+  prompt injection. The existing design bounds this: no host mounts, no
+  forwarded secrets, disposable credential copies — so the worst case stays
+  inside the throwaway container. If you want to tighten a session, agents
+  can restrict navigation with `--allowed-domains`.
+
 ## How your logins and configuration are handled
 
 Instead of requiring a fresh login inside the container, the script stages
