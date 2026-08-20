@@ -228,12 +228,21 @@ stage_pi() {
   stage "$HOME/.pi/agent/settings.json" .pi/agent/settings.json
 }
 
+# ~/.agents/skills is the shared Agent Skills location that every bundled
+# agent discovers: claude-code and opencode read ~/.agents/skills directly,
+# commandcode picks it up via its .agents compatibility, and pi treats it as
+# the global user skills directory. Skills are static, so a plain copy is
+# all that is needed.
+stage_skills() {
+  stage "$HOME/.agents/skills" .agents/skills
+}
+
 case "$AGENT" in
-  claude)      stage_claude ;;
-  commandcode) stage_commandcode ;;
-  opencode)    stage_opencode ;;
-  pi)          stage_pi ;;
-  "")          stage_claude; stage_commandcode; stage_opencode; stage_pi ;;
+  claude)      stage_claude; stage_skills ;;
+  commandcode) stage_commandcode; stage_skills ;;
+  opencode)    stage_opencode; stage_skills ;;
+  pi)          stage_pi; stage_skills ;;
+  "")          stage_claude; stage_commandcode; stage_opencode; stage_pi; stage_skills ;;
 esac
 
 DOCKER_ARGS+=(-v "$STAGING:/agent-config:ro")

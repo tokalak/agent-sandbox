@@ -102,6 +102,16 @@ Any agent can drive it via the CLI (`agent-browser --help` is
 self-explanatory); Command Code additionally ships a bundled agent-browser
 skill, so `agent-sandbox cmd` gets the full workflow guidance out of the box.
 
+## Shared agent skills
+
+Your user-level skills in `~/.agents/skills` (the [Agent Skills](https://agentskills.io)
+standard) are copied into the sandbox home, so every bundled agent — Claude Code,
+Command Code, opencode and Pi — can discover them: they all read `~/.agents/skills`
+as their global skills location. Like the rest of your configuration, they are
+copied, never mounted, and discarded with the container, so edits inside the
+sandbox don't touch your host copies. To add or update a skill, edit it on the
+host (or rebuild with `agent-sandbox --rebuild` after pulling a new one).
+
 Two deliberate constraints to know about:
 
 - Chromium runs with `--no-sandbox`: its in-process sandbox needs kernel
@@ -128,7 +138,9 @@ exits.
 For Claude Code this includes `~/.claude/settings.json`, `CLAUDE.md`, your
 `commands`/`agents`/`skills` directories, and `~/.claude.json` — with the
 per-project history of your other projects stripped out (requires `jq` on
-the host), so only the mounted project is visible to the agent.
+the host), so only the mounted project is visible to the agent. Your
+`~/.agents/skills` directory is staged for all agents — see
+[Shared agent skills](#shared-agent-skills).
 
 On macOS, Claude Code stores its credentials in the login Keychain rather
 than in a file, so the script exports them into the staged copy (mode 600)
